@@ -1,0 +1,64 @@
+---
+title: "Integrating nimble and deSolve in R"
+author: "Russell Dinnage"
+date: "11 January 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+So in previous posts I talked about how the R package `nimble` can be used to make fast functions to aid in writing fast simulations in R (here, and here). If your simulation are based on a system of ordinary differential equations (ODEs), then you've probably used the R package `deSolve` before. `deSolve` provides a number of functions for solving ODEs. Under the hood it uses C to speedup all of the iterations necessary to solve ODEs, which usually rely on approximating continuous time equations by calculating the equations over a number of small timesteps (so this can be a lot of iteration). Normally you write the ODEs out in an R function, however, which limits ulimately the speed of `deSolve`. `deSolve` does offer the ability to input a compiled DLL object that contains routines compiled in C or Fortran, which can greatly speed up computation in some cases. Here I will try and see if just compiling a function using `nimble` and then passing that as an R function to `deSolve` will be as fast as trying to compile the same function into a DLL and then passing that to `deSolve`.
+
+First we'll have to decide on a model to test this on. I'm going to start with a simple Lotka-Volterra style competition model for testing. I'll allow a flexible number of species in the model. Here's a basic implementation in base R, which we can compare the performance to. Parameters are a matrix of competition coefficients, a vector of initial growth rates,and a vector of carrying capacities (eg. (here)[https://en.wikipedia.org/wiki/Competitive_Lotka%E2%80%93Volterra_equations]).
+
+```{r base_R_model}
+library(nimble)
+library(deSolve)
+
+## setup a three specie system for testing
+nspec <- 3
+r <- 1
+K <- 2
+parms <- list()
+parms$nspec <- nspec
+parms$a <- matrix(runif(nspec^2), nrow = nspec, ncol = nspec)
+diag(parms$a) <- 1
+parms$r <- rep(r, nspec)
+parms$K <- rep(K, nspec)
+y <- runif(nspec, 0, 2)
+LV_mod_base <- function(t, y, parms) {
+  comp <- colSums(matrix(y, nrow = parms$nspec, ncol = parms$nspec) * parms$a)
+  new_y <- parms$r * y * (1 - (comp / K))
+  list(new_y)
+}
+
+system.time(test <- ode(y, 1:1000, LV_mod_base, parms))
+plot(test)
+
+system.time(test <- ode(y, 1:1000, LV_mod_base, parms, method = "rk4"))
+plot(test)
+
+```
+
+So that seems to work more or less. It looks like the Runge-Kutta method of integration takes more time than the default `lsoda` method. I've optimized it to use vectorization within R, which should give it a fighting chance against the `nimble` compiled version. Let's try a larger system with more species to see if we can get it to run slow.
+
+```{r bigger_R_base}
+nspec <- 300
+r <- 1
+K <- 2
+parms <- list()
+parms$nspec <- nspec
+parms$a <- matrix(runif(nspec^2), nrow = nspec, ncol = nspec)
+diag(parms$a) <- 1
+parms$r <- rep(r, nspec)
+parms$K <- rep(K, nspec)
+y <- runif(nspec, 0, 2)
+
+system.time(test <- ode(y, 1:1000, LV_mod_base, parms))
+plot(test, select = sample(nspec, 9))
+
+
+```
+At this point I don't really care if I've correctly specified the model, or the dynamics. I just want to know if the compiled version gives me the same answer but faster. So now I'll make the same model using `nimble`. The biggest problem to be solved here is that `deSolve` requires a function that outputs a list, but a `nimbleFunction` cannot output that type. That could be difficult to overcome actually.
