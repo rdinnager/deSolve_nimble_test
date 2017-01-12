@@ -61,4 +61,92 @@ plot(test, select = sample(nspec, 9))
 
 
 ```
-At this point I don't really care if I've correctly specified the model, or the dynamics. I just want to know if the compiled version gives me the same answer but faster. So now I'll make the same model using `nimble`. The biggest problem to be solved here is that `deSolve` requires a function that outputs a list, but a `nimbleFunction` cannot output that type. That could be difficult to overcome actually.
+At this point I don't really care if I've correctly specified the model, or the dynamics. I just want to know if the compiled version gives me the same answer but faster. So now I'll make the same model using `nimble`. The biggest problem to be solved here is that `deSolve` requires a function that outputs a list, but a `nimbleFunction` cannot output that type. So I will have to have a wrapper R function to feed in the parameters and format the output. This could add considerably to the overhead, so we will see whether we can get good performance.
+
+```{r}
+LV_mod_nimble <- nimbleFunction(
+  run = function(y = double(1), a = double(2), r = double(1), K = double(1), nspec = integer(0)) {
+    
+    new_y <- numeric(length = nspec, value = 0, init = TRUE)
+    
+    for (i in 1:nspec) {
+      new_y[i] <- r[i] * y[i] * (1 - (sum(a[ , i]*y) / K[i]))
+    }
+    
+    return(new_y)
+    returnType(double(1))
+  }
+)
+
+##test
+nspec <- 3
+r <- 1
+K <- 2
+parms <- list()
+parms$nspec <- nspec
+parms$a <- matrix(runif(nspec^2), nrow = nspec, ncol = nspec)
+diag(parms$a) <- 1
+parms$r <- rep(r, nspec)
+parms$K <- rep(K, nspec)
+y <- runif(nspec, 0, 2)
+
+test1 <- LV_mod_base(0, y, parms)[[1]]
+test2 <- LV_mod_nimble(y, parms$a, parms$r, parms$K, parms$nspec)
+identical(test1, test2)
+
+LV_mod_nimble_cmp <- compileNimble(LV_mod_nimble, showCompilerOutput = TRUE)
+
+```
+
+So now we will create an R function to wrap this `nimbleFunction`, so it will work with `deSolve`. Then we can compare the speed.
+
+```{r wrapper}
+LV_mod_nimble_wrap <- function(t, y, parms) {
+  list(LV_mod_nimble_cmp(y, parms$a, parms$r, parms$K, parms$nspec))
+}
+
+nspec <- 300
+r <- 1
+K <- 2
+parms <- list()
+parms$nspec <- nspec
+parms$a <- matrix(runif(nspec^2), nrow = nspec, ncol = nspec)
+diag(parms$a) <- 1
+parms$r <- rep(r, nspec)
+parms$K <- rep(K, nspec)
+y <- runif(nspec, 0, 2)
+
+system.time(test1 <- ode(y, 1:1000, LV_mod_base, parms))
+system.time(test2 <- ode(y, 1:1000, LV_mod_nimble_wrap, parms))
+
+all.equal(test1[[1]], test2[[1]])
+
+system.time(test1 <- ode(y, 1:1000, LV_mod_base, parms, method = "rk4"))
+system.time(test2 <- ode(y, 1:1000, LV_mod_nimble_wrap, parms, method = "rk4"))
+
+all.equal(test1[[1]], test2[[1]])
+
+```
+Well, that made a massive difference, especially using the Runge-Kutta methods. The 'lsoda' methods was only about twice as fast with `nimble`, but that is possibly because most of the time was spent in just setting up the model and 'deciding' what methods to use ('lsoda' methods switches between 'stiff' and 'non-stiff' methods internally to maximize integration efficiency). On the other hand, Runge-Kutta is a straightforward iterating algorithm, which takes much longer, but shouldn't have much overhead. There, the difference is very clear. The `nimbleFunction` was around 20 times faster. So it definitely seems worthwhile to write the differential equation function in `nimble`. Now, the only question is, will we see any further performance gain if we are able to compile the `nimbleFunction` into a shared object, and then input that into `deSolve`? 
+Since `nimble` has compiled the function and we can use it in R, it must have compiled it to a shared object somewhere. Perhaps we can simply access that already compiled shared object? I'm using Windows, so there should be a DLL somewhere. Having a look around in the `nimble` package environment, we find a hidden variable which might be what we're looking for. It's a filename for a DLL in a temporary directory. 
+
+```{r find_DLL}
+nimbleUserNamespace$sessionSpecificDll
+str(nimbleUserNamespace$sessionSpecificDll)
+
+```
+But I don't know what C symbol I should call to run the function. Having a look in the temporary directory that holds the .DLL I see another .DLL which looks more promising. It's names something like "P_1_rcfun_1_etc.dll", with a bunch of numbers instead of "_etc". I had a look in that .DLL using dependency walker. The function we want. 
+
+![](images/screenshot_depnds.gif)
+
+It is called "CALL_rcfun_x", where x is some number. I wonder if we can access this name through `nimble` somehow? I noticed that the `compileNimble` function has the option to specify a 'project'. I can't seem to find too much info on projects in `nimble`, but it seems to be a object used internally by the package. I can creat a new one by accessing an unexported function in `nimble`. This is generally not recommended to do, but until I find a better solution, I'll give it a try.
+
+```{r}
+nim_proj <- nimble:::nimbleProjectClass()
+nim_proj$projectName
+LV_mod_nimble_new <- compileNimble(LV_mod_nimble, showCompilerOutput = TRUE, project = nim_proj)
+```
+
+
+
+It is looking like I can't use the `nimble` compiled DLL in `deSolve` because
